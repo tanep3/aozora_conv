@@ -1,0 +1,343 @@
+#!/bin/bash
+
+# aozora_conv スクリプト
+# 概要:
+# 青空文庫形式のテキストファイルを処理し、作品名、著者名、本文を抽出・整形します。
+# さらに、指定した時間（分）で読める分量ごとに出力ファイルを分割する機能を持ちます。
+
+set -e
+
+# 一時ディレクトリの作成
+TEMP_DIR=$(mktemp -d /tmp/tmp_aozora_conv_XXXXXX)
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+# グローバル変数の初期化
+SPEED_OPTION=false
+SPEED=300  # デフォルト: 1分間に300文字
+TIME_OPTION=false
+TIME=20    # デフォルト: 20分
+INPUT_FILES=()
+OUTPUT_FILE=""
+HELP=false
+
+# 関数: ヘルプメッセージの表示
+show_help() {
+    cat << EOF
+使用方法: $0 [オプション]
+
+オプション:
+  -h, --help           ヘルプメッセージを表示して終了します。
+  -s, --speed NUM      読書スピードを指定します（1分間にNUM文字）。デフォルトは300。
+  -t, --time MINUTES   分割時間を指定します（分単位）。デフォルトは20分。
+  -i, --input FILE     入力ファイルを指定します。複数指定可能です。
+  -o, --output FILE    出力ファイルを指定します。
+
+実行例:
+  1. 出力ファイルを20分ごとに分割する場合（デフォルト速度300字/分）:
+     $0 -t 20 -i wagahaiwa_nekodearu.txt -o text.txt
+
+  2. 読書スピードを400字/分、出力ファイルを15分ごとに分割する場合:
+     $0 -s 400 -t 15 -i wagahaiwa_nekodearu.txt -o text.txt
+
+  3. 出力ファイルを指定せず、標準出力に出力する場合:
+     $0 -i wagahaiwa_nekodearu.txt
+EOF
+}
+
+# 関数: 必要なツールの確認
+check_tools() {
+    local tools=("nkf" "sed" "grep" "gawk" "mktemp" "tr" "head" "sort" "uniq" "wc")
+    for tool in "${tools[@]}"; do
+        if ! command -v "$tool" &> /dev/null; then
+            echo "エラー: 必要なツール '$tool' がインストールされていません。" >&2
+            echo "インストールしてから再実行してください。" >&2
+            exit 1
+        fi
+    done
+}
+
+# 関数: エラーメッセージの表示
+error_exit() {
+    echo "エラー: $1" >&2
+    exit 1
+}
+
+# 関数: パースオプション
+parse_options() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                HELP=true
+                shift
+                ;;
+            -s|--speed)
+                if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                    SPEED_OPTION=true
+                    SPEED="$2"
+                    shift 2
+                else
+                    error_exit "オプション '$1' には数値の引数が必要です。"
+                fi
+                ;;
+            -t|--time)
+                if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                    TIME_OPTION=true
+                    TIME="$2"
+                    shift 2
+                else
+                    error_exit "オプション '$1' には数値の引数が必要です。"
+                fi
+                ;;
+            -i|--input)
+                if [[ -n "$2" && ! "$2" =~ ^- ]]; then
+                    INPUT_FILES+=("$2")
+                    shift 2
+                else
+                    error_exit "オプション '$1' には引数が必要です。"
+                fi
+                ;;
+            -o|--output)
+                if [[ -n "$2" && ! "$2" =~ ^- ]]; then
+                    OUTPUT_FILE="$2"
+                    shift 2
+                else
+                    error_exit "オプション '$1' には引数が必要です。"
+                fi
+                ;;
+            *)
+                error_exit "不明なオプション: $1"
+                ;;
+        esac
+    done
+}
+
+# 関数: 入力の確認
+check_input() {
+    if [[ ${#INPUT_FILES[@]} -eq 0 ]]; then
+        if [[ -t 0 ]]; then
+            error_exit "入力が提供されていません。-i/--input オプションを使用するか、標準入力から入力してください。"
+        else
+            INPUT_FILES=("-")  # 標準入力
+        fi
+    else
+        for file in "${INPUT_FILES[@]}"; do
+            if [[ "$file" != "-" && ! -f "$file" ]]; then
+                error_exit "入力ファイル '$file' が存在しません。"
+            fi
+        done
+    fi
+
+    # エラーチェック: -o が指定されていない場合に -s または -t が指定されているとき
+    if [[ -z "$OUTPUT_FILE" && ( "$SPEED_OPTION" == true || "$TIME_OPTION" == true ) ]]; then
+        error_exit "-s/--speed および -t/--time オプションは -o/--output オプションと併用してください。"
+    fi
+
+    # エラーチェック: -o が指定されていない場合に -t が指定されているとき
+    if [[ -z "$OUTPUT_FILE" && "$TIME_OPTION" == true ]]; then
+        error_exit "-t/--time オプションを指定する場合は、-o/--output オプションを指定してください。"
+    fi
+}
+
+# 関数: 文字コードの検出と変換
+convert_encoding() {
+    local input="$1"
+    local output="$2"
+
+    if [[ "$input" == "-" ]]; then
+        encoding=$(nkf --guess)
+        nkf -w > "$output"
+        echo "入力の文字コードを検出しました: $encoding" >&2
+    else
+        encoding=$(nkf --guess "$input")
+        nkf -w "$input" > "$output"
+        echo "入力ファイル '$input' の文字コードを検出しました: $encoding" >&2
+    fi
+}
+
+# 関数: 説明書きブロックの削除
+remove_explanation_blocks() {
+    local input="$1"
+    local output="$2"
+    sed -E '/^-{50,}/,/^-{50,}/d' "$input" > "$output"
+}
+
+# 関数: 作品名と著者名の抽出
+extract_title_author() {
+    local input="$1"
+    local title_file="$TEMP_DIR/title.txt"
+    local author_file="$TEMP_DIR/author.txt"
+
+    TITLE=$(sed -n '1p' "$input" | sed -E 's/[^一-龥ぁ-んァ-ン々〆〤ーー]+//g')
+    AUTHOR=$(sed -n '2p' "$input" | sed -E 's/[^一-龥ぁ-んァ-ン々〆〤ーー]+//g')
+    echo "$TITLE" > "$title_file"
+    echo "$AUTHOR" > "$author_file"
+    sed '1,2d' "$input" > "$TEMP_DIR/clean.txt"
+}
+
+# 関数: 本文の抽出
+extract_body() {
+    local input="$1"
+    local output="$2"
+
+    END_MARKERS=("^底本：" "^底本の親本：" "^初出：入力：" "^校正：" "^青空文庫作成ファイル：")
+    END_REGEX=$(printf "|%s" "${END_MARKERS[@]}")
+    END_REGEX=${END_REGEX:1}
+
+    gawk -v end_regex="$END_REGEX" '
+        BEGIN { printing = 1 }
+        {
+            if (printing && $0 ~ end_regex) {
+                printing = 0
+            }
+            if (printing) {
+                print
+            }
+        }
+    ' "$input" > "$output"
+}
+
+# 関数: 制御記号とルビの削除
+remove_control_symbols() {
+    local input="$1"
+    local output="$2"
+    # 以下の制御記号を削除
+    # ｜, 《》, ［＃...］, ｛｝, 〚〛
+    # 「」は削除しない
+    sed -E 's/｜//g; s/《[^》]+》//g; s/［＃[^］]*］//g; s/｛[^｝]+｝//g; s/〚[^〛]+〛//g;' "$input" > "$output"
+}
+
+# 関数: その他の注釈や記号の削除
+remove_annotations() {
+    local input="$1"
+    local output="$2"
+    # ［＃...］は既に削除済みなので、他の注釈を削除
+    sed -E 's/〔[^〕]*〕//g; s/／＼//g; s/／"＼//g' "$input" > "$output"
+}
+
+# 関数: 出力内容の整形
+format_output() {
+    local title="$1"
+    local author="$2"
+    local body="$3"
+    local output="$4"
+
+    {
+        echo "$title"
+        echo "$author"
+        echo
+        cat "$body"
+    } > "$output"
+}
+
+# 関数: 出力ファイルの分割
+split_output() {
+    local input="$1"
+    local output_prefix="$2"
+    local split_chars=$((SPEED * TIME))
+    local file_num=1
+
+    # 初期化
+    current_count=0
+    current_content=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # 行の文字数をカウント（マルチバイト文字を正しくカウントするために wc -m を使用）
+        line_length=$(echo -n "$line" | wc -m)
+        # 改行も1文字としてカウント
+        total_length=$((line_length + 1))
+        current_count=$((current_count + total_length))
+        current_content+="$line"$'\n'
+
+        if [[ $current_count -ge $split_chars ]]; then
+            # 最初に来る改行で分割
+            echo "$current_content" > "${output_prefix}_$(printf '%03d' $file_num).txt"
+            file_num=$((file_num + 1))
+            current_count=0
+            current_content=""
+        fi
+    done < "$input"
+
+    # 残りの内容を出力
+    if [[ -n "$current_content" ]]; then
+        echo "$current_content" > "${output_prefix}_$(printf '%03d' $file_num).txt"
+    fi
+}
+
+# 関数: メイン処理
+main() {
+    parse_options "$@"
+
+    if $HELP; then
+        show_help
+        exit 0
+    fi
+
+    check_tools
+    check_input
+
+    # 入力ファイルの処理
+    CONCAT_INPUT="$TEMP_DIR/combined_input.txt"
+    > "$CONCAT_INPUT"
+
+    for file in "${INPUT_FILES[@]}"; do
+        if [[ "$file" == "-" ]]; then
+            convert_encoding "-" "$TEMP_DIR/converted_utf8.txt"
+            cat "$TEMP_DIR/converted_utf8.txt" >> "$CONCAT_INPUT"
+        else
+            convert_encoding "$file" "$TEMP_DIR/converted_utf8.txt"
+            cat "$TEMP_DIR/converted_utf8.txt" >> "$CONCAT_INPUT"
+        fi
+    done
+
+    # 説明書きブロックの削除
+    remove_explanation_blocks "$CONCAT_INPUT" "$TEMP_DIR/no_explain.txt"
+
+    # 作品名と著者名の抽出
+    extract_title_author "$TEMP_DIR/no_explain.txt" "$TEMP_DIR/title.txt"
+
+    # 本文の抽出
+    extract_body "$TEMP_DIR/clean.txt" "$TEMP_DIR/body.txt"
+
+    # 制御記号とルビの削除
+    remove_control_symbols "$TEMP_DIR/body.txt" "$TEMP_DIR/no_control.txt"
+
+    # その他の注釈や記号の削除
+    remove_annotations "$TEMP_DIR/no_control.txt" "$TEMP_DIR/processed_body.txt"
+
+    # 出力内容の整形
+    FINAL_OUTPUT="$TEMP_DIR/final_output.txt"
+    format_output "$TITLE" "$AUTHOR" "$TEMP_DIR/processed_body.txt" "$FINAL_OUTPUT"
+
+    # 出力ファイルの分割
+    if $TIME_OPTION; then
+        if [[ -z "$OUTPUT_FILE" ]]; then
+            error_exit "-t/--time オプションを指定する場合は、-o/--output オプションを指定してください。"
+        fi
+        OUTPUT_PREFIX="${OUTPUT_FILE%.txt}"
+        split_output "$FINAL_OUTPUT" "$OUTPUT_PREFIX"
+    fi
+
+echo "$OUTPUT_FILE" >&2
+echo "$TIME_OPTION" >&2
+
+    # 出力先の指定
+    if [[ -n "$OUTPUT_FILE" && !$TIME_OPTION ]]; then
+        echo "出力ファイル: $OUTPUT_FILE" >&2
+        cat "$FINAL_OUTPUT" > "$OUTPUT_FILE"
+    elif [[ -z "$OUTPUT_FILE" && !$TIME_OPTION ]]; then
+        echo "標準出力に出力します。" >&2
+        cat "$FINAL_OUTPUT"
+    fi
+
+    # 総文字数と推定読書時間の計算
+    total_chars=$(wc -m < "$FINAL_OUTPUT")
+    estimated_time=$(( (total_chars + SPEED - 1) / SPEED ))  # 切り上げ
+
+    echo "総文字数: $total_chars 字" >&2
+    echo "推定読書時間: $estimated_time 分" >&2
+
+    echo "処理が完了しました。" >&2
+}
+
+# スクリプトの実行
+main "$@"
